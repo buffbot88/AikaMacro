@@ -225,3 +225,213 @@ fn load_config(skills: &Arc<RwLock<Vec<Skill>>>) -> Result<(), String> {
     *skills.write().map_err(|_| "Could not update settings".to_owned())? = config.skills;
     Ok(())
 }
+
+
+fn apply_theme(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    let visuals = &mut style.visuals;
+    visuals.dark_mode = true;
+    visuals.override_text_color = Some(TEXT);
+    visuals.panel_fill = BG;
+    visuals.window_fill = BG;
+    visuals.window_stroke = Stroke::new(1.0_f32, BORDER);
+    visuals.widgets.noninteractive.bg_fill = PANEL;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
+    visuals.widgets.inactive.bg_fill = INPUT_BG;
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x2C, 0x33, 0x3A);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT);
+    visuals.widgets.active.bg_fill = ACCENT;
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, TEXT);
+    visuals.selection.bg_fill = ACCENT;
+    visuals.selection.stroke = Stroke::new(1.0_f32, TEXT);
+    ctx.set_style(style);
+}
+
+fn toggle(ui: &mut egui::Ui, enabled: &mut bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(40.0, 22.0), Sense::click());
+    if response.clicked() { *enabled = !*enabled; }
+    let painter = ui.painter();
+    painter.rect_filled(rect, Rounding::same(11.0), if *enabled { ACCENT } else { BORDER });
+    let x = if *enabled { rect.right() - 11.0 } else { rect.left() + 11.0 };
+    painter.circle_filled(egui::pos2(x, rect.center().y), 8.0, TEXT);
+    response
+}
+
+fn action_button(ui: &mut egui::Ui, label: &str, enabled: bool, primary: bool) -> egui::Response {
+    let fill = if primary && enabled { ACCENT } else { PANEL };
+    let stroke = if primary && enabled { ACCENT } else { BORDER };
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(RichText::new(label).size(14.0).color(if enabled { TEXT } else { DISABLED }))
+            .min_size(Vec2::new(0.0, 40.0))
+            .rounding(Rounding::same(6.0))
+            .fill(fill)
+            .stroke(Stroke::new(1.0_f32, stroke)),
+    )
+}
+
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        apply_theme(ctx);
+        if !self.hotkeys_started {
+            let skills = Arc::clone(&self.skills);
+            let running = Arc::clone(&self.running);
+            let generation = Arc::clone(&self.generation);
+            let status = Arc::clone(&self.status);
+            thread::spawn(move || {
+                let mut previous_p = false;
+                let mut previous_s = false;
+                loop {
+                    unsafe {
+                        let ctrl = (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
+                        let p = (GetAsyncKeyState(VK_P.0 as i32) as u16 & 0x8000) != 0;
+                        let s = (GetAsyncKeyState(VK_S.0 as i32) as u16 & 0x8000) != 0;
+                        if ctrl && p && !previous_p { start_macro(&skills, &running, &generation, &status); set_status(&status, "Running"); }
+                        if ctrl && s && !previous_s { stop_macro(&running, &generation); set_status(&status, "Stopped"); }
+                        previous_p = p;
+                        previous_s = s;
+                    }
+                    thread::sleep(Duration::from_millis(30));
+                }
+            });
+            self.hotkeys_started = true;
+        }
+        if !self.running.load(Ordering::Acquire) { set_status(&self.status, "Stopped"); }
+        let status = self.status.read().map(|v| v.clone()).unwrap_or_else(|_| "Status unavailable".into());
+        let running = self.running.load(Ordering::Acquire);
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin::same(20.0)))
+            .show(ctx, |ui| {
+
+                ui.label(RichText::new("AikaTK Macro").size(23.0).strong().color(TEXT));
+                ui.add_space(2.0);
+                ui.label(RichText::new("Keyboard macro utility with per-slot timing.").size(13.0).color(DIM));
+                ui.add_space(14.0);
+
+                egui::Frame::none()
+                    .fill(PANEL)
+                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .rounding(Rounding::same(8.0))
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                    .show(ui, |ui| {
+                        let columns = [
+                            ("En.", 55.0), ("Slot", 50.0), ("Key", 130.0),
+                            ("Interval (ms)", 145.0), ("Press (ms)", 125.0), ("Release delay (ms)", 155.0),
+                        ];
+                        ui.horizontal(|ui| {
+                            for (label, width) in columns {
+                                ui.allocate_ui_with_layout(Vec2::new(width, 20.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                    ui.label(RichText::new(label).size(11.0).color(DIM));
+                                });
+                            }
+                        });
+                        ui.add_space(4.0);
+
+                        if let Ok(mut skills) = self.skills.write() {
+                            for (index, skill) in skills.iter_mut().enumerate() {
+                                let row_color = if index % 2 == 0 { PANEL } else { ROW_ALT };
+                                egui::Frame::none()
+                                    .fill(row_color)
+                                    .inner_margin(egui::Margin::symmetric(4.0, 6.0))
+                                    .show(ui, |ui| {
+                                        ui.set_min_height(52.0);
+                                        ui.horizontal_centered(|ui| {
+                                            ui.allocate_ui_with_layout(Vec2::new(55.0, 52.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                                toggle(ui, &mut skill.enabled);
+                                            });
+                                            ui.allocate_ui_with_layout(Vec2::new(50.0, 52.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                                ui.label(RichText::new((index + 1).to_string()).size(14.0).color(TEXT));
+                                            });
+                                            ui.allocate_ui_with_layout(Vec2::new(130.0, 52.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                                ui.add_sized([114.0, 34.0], egui::TextEdit::singleline(&mut skill.key).horizontal_align(egui::Align::Center));
+                                            });
+                                            ui.allocate_ui_with_layout(Vec2::new(145.0, 52.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                                ui.add_sized([129.0, 34.0], egui::DragValue::new(&mut skill.interval_ms).range(MIN_INTERVAL..=3_600_000).speed(1.0));
+                                            });
+                                            ui.allocate_ui_with_layout(Vec2::new(125.0, 52.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                                ui.add_sized([109.0, 34.0], egui::DragValue::new(&mut skill.press_ms).range(MIN_PRESS..=60_000).speed(1.0));
+                                            });
+                                            ui.allocate_ui_with_layout(Vec2::new(155.0, 52.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                                ui.add_sized([139.0, 34.0], egui::DragValue::new(&mut skill.release_ms).range(MIN_RELEASE..=60_000).speed(1.0));
+                                            });
+                                        });
+                                    });
+                            }
+                        }
+                    });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if action_button(ui, "▶  Start", !running, true).clicked() {
+                        start_macro(&self.skills, &self.running, &self.generation, &self.status);
+                        set_status(&self.status, "Running");
+                    }
+                    ui.add_space(4.0);
+                    if action_button(ui, "■  Stop", running, false).clicked() {
+                        stop_macro(&self.running, &self.generation);
+                        set_status(&self.status, "Stopped");
+                    }
+                    ui.add_space(12.0);
+                    if action_button(ui, "Save Config", true, false).clicked() {
+                        set_status(&self.status, match save_config(&self.skills) {
+                            Ok(()) => "Configuration saved".into(),
+                            Err(error) => format!("Save failed: {error}"),
+                        });
+                    }
+                    ui.add_space(4.0);
+                    if action_button(ui, "Load Config", true, false).clicked() {
+                        set_status(&self.status, match load_config(&self.skills) {
+                            Ok(()) => "Configuration loaded".into(),
+                            Err(error) => format!("Load failed: {error}"),
+                        });
+                    }
+                });
+                ui.add_space(8.0);
+
+                egui::Frame::none()
+                    .fill(PANEL)
+                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .rounding(Rounding::same(5.0))
+                    .inner_margin(egui::Margin::symmetric(14.0, 9.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Global hotkeys:  Ctrl+P Start  •  Ctrl+S Stop").size(12.0).color(DIM));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let color = if status == "Stopped" {
+                                    NEUTRAL
+                                } else if status.starts_with("Running") {
+                                    SUCCESS
+                                } else if status.starts_with("Input failed")
+                                    || status.starts_with("Invalid")
+                                    || status.starts_with("Process check")
+                                {
+                                    ERROR_COLOR
+                                } else {
+                                    ACCENT
+                                };
+                                ui.label(RichText::new(format!("● Status: {status}")).size(12.0).color(color));
+                            });
+                        });
+                    });
+            });
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
+}
+
+fn main() -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size(Vec2::new(880.0, 640.0))
+            .with_min_inner_size(Vec2::new(820.0, 600.0))
+            .with_title("AikaTK Macro"),
+        ..Default::default()
+    };
+    eframe::run_native("AikaTK Macro", options, Box::new(|_| Ok(Box::<App>::default())))
+}
