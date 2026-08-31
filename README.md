@@ -61,3 +61,30 @@ Example:
 - The program sends documented Windows `SendInput` keyboard events. It does not load DLLs, access game memory, capture screens, inspect game state, install drivers, use AI, or bypass anti-cheat software.
 - If AIKATK/nProtect blocks synthetic input, ensure the executable is properly signed or installed in `Program Files` for UIAccess to be active.
 - nProtect may still detect or block automation; use it only where the game/server rules explicitly permit macros.
+
+## Release Signing (SignPath, Open Source)
+
+The release executable ships with a `UIAccess="true"` manifest (same mechanism as Windows On-Screen Keyboard). Windows only accepts UIAccess for executables that are **digitally signed with a trusted certificate chain** — running as administrator is not sufficient, which is why local admin launches still fail with error 740.
+
+This repo ships a GitHub Actions workflow (`.github/workflows/release.yml`) that builds the exe on a GitHub-hosted Windows runner and submits it to [SignPath](https://signpath.io) for Authenticode signing under their free Open Source Code Signing program.
+
+### One-time setup
+
+1. Apply for SignPath Open Source Code Signing at <https://signpath.io>, linking your GitHub repository.
+2. In SignPath, create:
+   - A **project** with slug `aikatk-macro`
+   - An **artifact configuration** with slug `aikatk-macro-exe` (Authenticode, targets the single `.exe` file inside the uploaded artifact)
+   - A **signing policy** with slug `release-signing`
+   - A **CI user** and an API token for it
+3. In your GitHub repo, add repository secrets:
+   - `SIGNPATH_API_TOKEN` — the CI user's API token
+   - `SIGNPATH_ORGANIZATION_ID` — your SignPath organization ID
+
+### Release flow
+
+1. Tag a release: `git tag v0.1.0 && git push origin v0.1.0` (or run the workflow manually via **Run workflow**).
+2. The workflow builds `target/release/aikatk_macro.exe`, uploads it as the unsigned workflow artifact, submits it to SignPath, waits for the signed result, then publishes the signed `AikaTK-Macro.exe` as a workflow artifact and attaches it to the GitHub Release.
+3. Verify: Properties → **Digital Signatures** tab on `AikaTK-Macro.exe` shows the expected publisher/certificate.
+4. Distribute **only the signed exe**, never the unsigned workflow artifact.
+
+Note: publishing the signed exe requires the repository to allow the default GITHUB_TOKEN to create releases (standard setting, enabled by default).
