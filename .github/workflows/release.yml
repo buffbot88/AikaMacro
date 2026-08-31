@@ -47,6 +47,12 @@ jobs:
             GitHubRepositoryUrl: "${{ github.server_url }}/${{ github.repository }}"
             GithubWorkflowRunId: "${{ github.run_id }}"
 
+      - name: Rename signed exe
+        shell: pwsh
+        run: |
+          $file = Get-ChildItem signed -Filter *.exe | Select-Object -First 1
+          Move-Item $file.FullName signed/AikaTK-Macro.exe
+
       - name: Upload signed artifact
         uses: actions/upload-artifact@v4
         with:
