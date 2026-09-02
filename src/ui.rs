@@ -50,14 +50,7 @@ const ID_TIMER_BASE: usize = 300;
 const ID_TOGGLE_BASE: usize = 400;
 const WM_APP_DONE: u32 = WM_APP + 1;
 const WM_APP_ERROR: u32 = WM_APP + 2;
-const WM_APP_EDITOR: u32 = WM_APP + 3;
-const ID_EDITOR_DONE: usize = 900;
-const ID_EDITOR_CTRL: usize = 901;
-const ID_EDITOR_SHIFT: usize = 902;
-const ID_EDITOR_KEY: usize = 903;
-const ID_EDITOR_INTERVAL: usize = 904;
-const ID_EDITOR_PRESS: usize = 905;
-const ID_EDITOR_RELEASE: usize = 906;
+const WM_APP_OPEN_EDITOR: u32 = WM_APP + 3;
 
 pub struct Ui {
     pub hwnd: HWND,
@@ -71,8 +64,7 @@ pub struct Ui {
     mode: HWND,
     stop_flag: Arc<AtomicBool>,
     capture: Option<usize>,
-    editor: HWND,
-    editor_slot: Option<usize>,
+    last_error: Option<String>,
 }
 
 pub fn run(model: AppConfig) -> Result<()> {
@@ -100,8 +92,7 @@ pub fn run(model: AppConfig) -> Result<()> {
             mode: HWND::default(),
             stop_flag: Arc::new(AtomicBool::new(false)),
             capture: None,
-            editor: HWND::default(),
-            editor_slot: None,
+            last_error: None,
         });
         let hwnd = CreateWindowExW(
             WS_EX_APPWINDOW,
@@ -174,7 +165,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             };
             LRESULT(0)
         }
-        WM_APP_EDITOR => {
+        WM_APP_OPEN_EDITOR => {
             open_editor(ui, wp.0);
             LRESULT(0)
         }
@@ -316,8 +307,9 @@ unsafe fn layout(ui: &mut Ui) {
     let _ = MoveWindow(ui.start, 8, 100, 105, 30, true);
     let _ = MoveWindow(ui.stop, 120, 100, 90, 30, true);
 }
+#[allow(dead_code)]
 unsafe fn open_editor(ui: &mut Ui, index: usize) {
-    if index >= SLOT_COUNT || !ui.editor.0.is_null() {
+    if index >= SLOT_COUNT {
         return;
     }
     let slot = ui.model.lock().unwrap().slots[index].clone();
@@ -350,7 +342,7 @@ unsafe fn command(ui: &mut Ui, wp: WPARAM) {
         },
         id if (ID_SLOT_BASE..ID_SLOT_BASE + 8).contains(&id) => {
             let i = id - ID_SLOT_BASE;
-            let _ = PostMessageW(Some(ui.hwnd), WM_APP_EDITOR, WPARAM(i), LPARAM(0));
+            let _ = PostMessageW(Some(ui.hwnd), WM_APP_OPEN_EDITOR, WPARAM(i), LPARAM(0));
             ui.capture = Some(i);
             let _ = SetWindowTextW(ui.keys[i], PCWSTR(wide("Press...").as_ptr()));
             let _ = PostMessageW(Some(ui.keys[i]), 0x0007, WPARAM(0), LPARAM(0));
@@ -477,8 +469,19 @@ unsafe fn start_macro(ui: &mut Ui) {
         let osk = HWND(osk_raw as *mut std::ffi::c_void);
         let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
         let result = macro_engine::run(&model, stop.clone(), |a| unsafe { perform(osk, a) });
-        let msg = if result { WM_APP_DONE } else { WM_APP_DONE };
-        let _ = PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(0));
+        if result {
+            let _ = PostMessageW(Some(hwnd), WM_APP_DONE, WPARAM(0), LPARAM(0));
+        } else if !stop.load(Ordering::Relaxed) {
+            let message = Box::new(String::from("OSK input failed or a key could not be found"));
+            let _ = PostMessageW(
+                Some(hwnd),
+                WM_APP_ERROR,
+                WPARAM(0),
+                LPARAM(Box::into_raw(message) as isize),
+            );
+        } else {
+            let _ = PostMessageW(Some(hwnd), WM_APP_DONE, WPARAM(0), LPARAM(0));
+        }
     });
 }
 unsafe fn stop_macro(ui: &mut Ui) {
@@ -579,6 +582,7 @@ unsafe fn set_status(ui: &mut Ui, text: &str) {
     set_enabled(ui.stop, text == "● Running");
 }
 unsafe fn set_error(ui: &mut Ui, text: String) {
+    ui.last_error = Some(text.clone());
     MessageBoxW(
         Some(ui.hwnd),
         PCWSTR(wide(&text).as_ptr()),
@@ -587,8 +591,24 @@ unsafe fn set_error(ui: &mut Ui, text: String) {
     );
     set_status(ui, "● Error");
 }
-unsafe fn register_hotkeys(_h: HWND) {}
-unsafe fn unregister_hotkeys(_h: HWND) {}
+unsafe fn register_hotkeys(h: HWND) {
+    let _ = windows::Win32::UI::WindowsAndMessaging::RegisterHotKey(
+        Some(h),
+        1,
+        windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(2),
+        0x50,
+    );
+    let _ = windows::Win32::UI::WindowsAndMessaging::RegisterHotKey(
+        Some(h),
+        2,
+        windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(2),
+        0x53,
+    );
+}
+unsafe fn unregister_hotkeys(h: HWND) {
+    let _ = windows::Win32::UI::WindowsAndMessaging::UnregisterHotKey(Some(h), 1);
+    let _ = windows::Win32::UI::WindowsAndMessaging::UnregisterHotKey(Some(h), 2);
+}
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
