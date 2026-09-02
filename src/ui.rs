@@ -16,7 +16,11 @@ use std::{
 use windows::{
     core::{w, PCWSTR},
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Graphics::Gdi::{
+            BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, SetBkMode,
+            SetTextColor, TextOutW, PAINTSTRUCT, TRANSPARENT,
+        },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Input::KeyboardAndMouse::{
@@ -32,7 +36,7 @@ use windows::{
                 SetWindowTextW, ShowWindow, TranslateMessage, CREATESTRUCTW, CW_USEDEFAULT,
                 GWLP_USERDATA, HMENU, IDC_ARROW, MB_ICONERROR, MB_OK, MINMAXINFO, MSG, SW_SHOW,
                 WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_GETMINMAXINFO, WM_HOTKEY, WM_KEYDOWN,
-                WM_NCCREATE, WM_SIZE, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
+                WM_NCCREATE, WM_PAINT, WM_SIZE, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
                 WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
                 WS_THICKFRAME, WS_VISIBLE,
             },
@@ -50,6 +54,12 @@ const ID_TIMER_BASE: usize = 300;
 const ID_TOGGLE_BASE: usize = 400;
 const WM_APP_DONE: u32 = WM_APP + 1;
 const WM_APP_ERROR: u32 = WM_APP + 2;
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn RegisterHotKey(hwnd: *mut c_void, id: i32, modifiers: u32, key: u32) -> i32;
+    fn UnregisterHotKey(hwnd: *mut c_void, id: i32) -> i32;
+}
 const WM_APP_OPEN_EDITOR: u32 = WM_APP + 3;
 
 pub struct Ui {
@@ -151,6 +161,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         WM_SIZE => {
             layout(ui);
+            LRESULT(0)
+        }
+        WM_PAINT => {
+            paint(hwnd);
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -308,6 +322,22 @@ unsafe fn layout(ui: &mut Ui) {
     let _ = MoveWindow(ui.stop, 120, 100, 90, 30, true);
 }
 #[allow(dead_code)]
+unsafe fn paint(hwnd: HWND) {
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    let brush = CreateSolidBrush(COLORREF(0x00201B17));
+    let _ = FillRect(hdc, &ps.rcPaint, brush);
+    let _ = DeleteObject(brush.into());
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, COLORREF(0x00F1F4F7));
+    let title = wide("OSK Macro");
+    let subtitle = wide("Compact Windows keyboard macro");
+    let hints = wide("Ctrl+P Start  •  Ctrl+S Stop");
+    let _ = TextOutW(hdc, 12, 8, &title[..title.len() - 1]);
+    let _ = TextOutW(hdc, 12, 27, &subtitle[..subtitle.len() - 1]);
+    let _ = TextOutW(hdc, 530, 108, &hints[..hints.len() - 1]);
+    let _ = EndPaint(hwnd, &ps);
+}
 unsafe fn open_editor(ui: &mut Ui, index: usize) {
     if index >= SLOT_COUNT {
         return;
@@ -592,22 +622,12 @@ unsafe fn set_error(ui: &mut Ui, text: String) {
     set_status(ui, "● Error");
 }
 unsafe fn register_hotkeys(h: HWND) {
-    let _ = windows::Win32::UI::WindowsAndMessaging::RegisterHotKey(
-        Some(h),
-        1,
-        windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(2),
-        0x50,
-    );
-    let _ = windows::Win32::UI::WindowsAndMessaging::RegisterHotKey(
-        Some(h),
-        2,
-        windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(2),
-        0x53,
-    );
+    let _ = RegisterHotKey(h.0, 1, 0x0002, 0x50);
+    let _ = RegisterHotKey(h.0, 2, 0x0002, 0x53);
 }
 unsafe fn unregister_hotkeys(h: HWND) {
-    let _ = windows::Win32::UI::WindowsAndMessaging::UnregisterHotKey(Some(h), 1);
-    let _ = windows::Win32::UI::WindowsAndMessaging::UnregisterHotKey(Some(h), 2);
+    let _ = UnregisterHotKey(h.0, 1);
+    let _ = UnregisterHotKey(h.0, 2);
 }
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
