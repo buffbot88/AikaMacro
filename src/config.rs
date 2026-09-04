@@ -44,14 +44,22 @@ impl Default for MacroSlot {
 pub struct AppConfig {
     pub slots: [MacroSlot; SLOT_COUNT],
     pub input_mode: InputMode,
+    pub logging: bool,
 }
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             slots: std::array::from_fn(|_| MacroSlot::default()),
             input_mode: InputMode::VirtualKey,
+            logging: true,
         }
     }
+}
+
+pub fn log_path() -> PathBuf {
+    std::env::current_exe()
+        .unwrap_or_else(|_| PathBuf::from("osk-macro.exe"))
+        .with_file_name("osk-macro.log")
 }
 
 pub fn config_path() -> PathBuf {
@@ -69,6 +77,7 @@ pub fn load(path: &Path) -> Result<AppConfig> {
 }
 pub fn save(path: &Path, config: &AppConfig) -> Result<()> {
     let mut out = String::from("version=1\n");
+    out.push_str(&format!("logging={}\n", config.logging));
     out.push_str(&format!(
         "input_mode={}\n",
         match config.input_mode {
@@ -92,6 +101,10 @@ pub fn parse(text: &str) -> Result<AppConfig> {
         let Some((k, v)) = line.split_once('=') else {
             continue;
         };
+        if k == "logging" {
+            config.logging = parse_bool(v)?;
+            continue;
+        }
         if k == "input_mode" {
             config.input_mode = match v {
                 "scan-code" => InputMode::ScanCode,
@@ -176,6 +189,13 @@ mod tests {
         fs::remove_file(p).unwrap();
         assert_eq!(loaded, c);
     }
+    #[test]
+    fn logging_setting_round_trips() {
+        let config = parse("version=1\nlogging=false\ninput_mode=scan-code\n").unwrap();
+        assert!(!config.logging);
+        assert_eq!(config.input_mode, InputMode::ScanCode);
+    }
+
     #[test]
     fn rejects_ninth_slot() {
         let mut t = String::new();

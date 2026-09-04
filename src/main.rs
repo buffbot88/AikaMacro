@@ -1,5 +1,14 @@
+#![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
+
+#[cfg(target_os = "windows")]
+mod accessibility;
 mod config;
+#[cfg(target_os = "windows")]
+mod editor;
+mod logger;
 mod macro_engine;
+#[cfg(target_os = "windows")]
+mod osk;
 #[cfg(target_os = "windows")]
 mod ui;
 
@@ -14,22 +23,15 @@ use std::{
 };
 
 #[cfg(target_os = "windows")]
-use windows::{
-    core::{w, PCWSTR},
-    Win32::{
-        Foundation::{HANDLE, HWND, LPARAM, RECT},
-        System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
-        System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
-        UI::{
-            Input::KeyboardAndMouse::{
-                keybd_event, SendInput, INPUT, INPUT_0, INPUT_MOUSE, KEYEVENTF_KEYUP,
-                MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE,
-                MOUSEINPUT, VK_CONTROL,
-            },
-            WindowsAndMessaging::{
-                EnumWindows, FindWindowExW, GetClassNameW, GetWindowRect, GetWindowTextW,
-                IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE,
-            },
+use windows::Win32::{
+    Foundation::{HANDLE, HWND, LPARAM},
+    System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
+    System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
+    UI::{
+        Input::KeyboardAndMouse::{keybd_event, KEYEVENTF_KEYUP, VK_CONTROL},
+        WindowsAndMessaging::{
+            EnumWindows, GetClassNameW, GetWindowTextW, IsWindowVisible, SetForegroundWindow,
+            ShowWindow, SW_RESTORE,
         },
     },
 };
@@ -37,6 +39,16 @@ use windows::{
 const CF_UNICODETEXT: u32 = 13;
 
 fn main() -> Result<()> {
+    let config_file = config_path();
+    let config = load(&config_file);
+    let logging_enabled = config.as_ref().map(|value| value.logging).unwrap_or(true);
+    let log = logger::init(logging_enabled, config::log_path());
+    log.log(format!(
+        "starting osk-typer; logging_enabled={logging_enabled}"
+    ));
+    if let Err(error) = &config {
+        log.log(format!("configuration load failed: {error:#}"));
+    }
     #[cfg(not(target_os = "windows"))]
     {
         anyhow::bail!("osk-typer only supports Windows");
@@ -44,12 +56,54 @@ fn main() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         let mut args = env::args().skip(1);
+        let config = match config {
+            Ok(config) => config,
+            Err(error) => {
+                report_startup_error(&error);
+                return Err(error);
+            }
+        };
         if args.next().is_none() {
-            return ui::run(load(&config_path())?);
+            logger::log("launching desktop UI");
+            let result = ui::run(config);
+            if let Err(error) = &result {
+                logger::log(format!("desktop UI exited with error: {error:#}"));
+                report_startup_error(error);
+            }
+            return result;
         }
-        let text = env::args().nth(1).context("missing text")?;
-        let config = load(&config_path())?;
-        run(&text, &config)
+        let text = match env::args().nth(1).context("missing text") {
+            Ok(text) => text,
+            Err(error) => {
+                report_startup_error(&error);
+                return Err(error);
+            }
+        };
+        logger::log("launching CLI macro flow");
+        let result = run(&text, &config);
+        if let Err(error) = &result {
+            logger::log(format!("CLI macro flow failed: {error:#}"));
+            report_startup_error(error);
+        }
+        result
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn report_startup_error(error: &anyhow::Error) {
+    use windows::{
+        core::PCWSTR,
+        Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK},
+    };
+    let message = format!("{error:#}\n\nDetails were written to osk-macro.log.");
+    let title = "OSK Macro could not start";
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            PCWSTR(wide(&message).as_ptr()),
+            PCWSTR(wide(title).as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
     }
 }
 
@@ -109,13 +163,9 @@ fn prompt_u64(s: &str, d: u64) -> Result<u64> {
 
 #[cfg(target_os = "windows")]
 fn run(text: &str, config: &config::AppConfig) -> Result<()> {
-    let (osk, notepad) = unsafe {
-        (
-            find_window("On-Screen Keyboard", "OSKMainClass")
-                .context("launch On-Screen Keyboard first")?,
-            find_window("Notepad", "Notepad").context("launch Notepad first")?,
-        )
-    };
+    let osk_session = osk::Session::start()?;
+    let osk = osk_session.hwnd;
+    let notepad = unsafe { find_window("Notepad", "Notepad").context("launch Notepad first")? };
     unsafe {
         let _ = ShowWindow(notepad, SW_RESTORE);
         let _ = SetForegroundWindow(notepad);
@@ -130,15 +180,35 @@ fn run(text: &str, config: &config::AppConfig) -> Result<()> {
     }
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_run = stop.clone();
-    run_macro(config, stop_for_run, |action| unsafe {
-        match action {
-            MacroAction::ModifierDown(k) => click_button(osk, k, 50).is_ok(),
-            MacroAction::ModifierUp(k) => click_button(osk, k, 0).is_ok(),
-            MacroAction::KeyDown(k) => click_button(osk, k, 50).is_ok(),
-            MacroAction::KeyUp(k) => click_button(osk, k, 0).is_ok(),
-            _ => true,
-        }
+    let mut failure = None;
+    let completed = run_macro(config, stop_for_run, |action| match action {
+        MacroAction::ModifierDown(k) => match crate::accessibility::invoke_control(osk, k) {
+            Ok(()) => true,
+            Err(error) => {
+                failure = Some(format!("{error:#}"));
+                false
+            }
+        },
+        MacroAction::ModifierUp(k) => match crate::accessibility::invoke_control(osk, k) {
+            Ok(()) => true,
+            Err(error) => {
+                failure = Some(format!("{error:#}"));
+                false
+            }
+        },
+        MacroAction::KeyDown(k) => match crate::accessibility::invoke_control(osk, k) {
+            Ok(()) => true,
+            Err(error) => {
+                failure = Some(format!("{error:#}"));
+                false
+            }
+        },
+        MacroAction::KeyUp(_) | MacroAction::Hold(_) | MacroAction::Delay(_) => true,
     });
+    drop(osk_session);
+    if !completed {
+        anyhow::bail!(failure.unwrap_or_else(|| "OSK input failed".to_string()));
+    }
     Ok(())
 }
 #[cfg(target_os = "windows")]
@@ -178,49 +248,6 @@ unsafe fn find_window(title: &str, class_name: &str) -> Option<HWND> {
 #[cfg(target_os = "windows")]
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
-}
-#[cfg(target_os = "windows")]
-unsafe fn click_button(parent: HWND, label: &str, hold: u64) -> Result<()> {
-    let b = FindWindowExW(
-        Some(parent),
-        None,
-        w!("Button"),
-        PCWSTR(wide(label).as_ptr()),
-    )?;
-    let mut r = RECT::default();
-    GetWindowRect(b, &mut r)?;
-    let x = ((r.left + r.right) / 2).clamp(0, 65535);
-    let y = ((r.top + r.bottom) / 2).clamp(0, 65535);
-    let d = INPUT {
-        r#type: INPUT_MOUSE,
-        Anonymous: INPUT_0 {
-            mi: MOUSEINPUT {
-                dx: x,
-                dy: y,
-                mouseData: 0,
-                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_LEFTDOWN,
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    };
-    let u = INPUT {
-        r#type: INPUT_MOUSE,
-        Anonymous: INPUT_0 {
-            mi: MOUSEINPUT {
-                dx: x,
-                dy: y,
-                mouseData: 0,
-                dwFlags: MOUSEEVENTF_LEFTUP,
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    };
-    SendInput(&[d], std::mem::size_of::<INPUT>() as i32);
-    thread::sleep(Duration::from_millis(hold));
-    SendInput(&[u], std::mem::size_of::<INPUT>() as i32);
-    Ok(())
 }
 #[cfg(target_os = "windows")]
 fn send_ctrl_v() {
